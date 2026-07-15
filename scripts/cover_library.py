@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Fetch, shortlist, and preview cover cases from a Feishu document's embedded Base."""
+"""Maintain, shortlist, and preview cover cases from a Feishu document's embedded Base."""
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import math
 import os
@@ -16,11 +17,118 @@ from typing import Any
 
 
 DEFAULT_DOC_URL = "https://xinyouduzhong.feishu.cn/docx/E7pZdhudNo2glpxILQFcLxBgnEc"
-EXPECTED_FIELDS = ("编号", "封面", "关键字", "适用场景")
+SOURCE_FIELDS = ("编号", "封面", "关键字", "适用场景")
+STRUCTURE_FIELD = "AI结构标注"
+ANNOTATION_VERSION = 1
+MACHINE_INDEX_MARKER = "--- 机器索引（请勿手动修改） ---"
+ANNOTATION_REQUIRED = (
+    "capacity", "line_range", "layout", "subject", "safe_areas", "hierarchy",
+    "elements", "style", "hook", "content", "ocr", "summary",
+)
+CAPACITY_ORDER = ("micro", "short", "medium", "long", "dense")
+CAPACITY_LABELS = {
+    "micro": "极少字",
+    "short": "少字",
+    "medium": "中等文案",
+    "long": "较长文案",
+    "dense": "多字密集",
+}
+LAYOUT_LABELS = {
+    "top_only": "文字集中在顶部",
+    "top_bottom": "上下分区",
+    "left_text_right_subject": "左文右人／物",
+    "right_text_left_subject": "右文左人／物",
+    "text_around_center_subject": "文字环绕中心主体",
+    "bottom_caption": "底部标题",
+    "full_scene_minimal_text": "完整场景配少量文字",
+    "collage_note_board": "拼贴／便签板",
+}
+SUBJECT_LABELS = {
+    "center_person": "人物居中",
+    "left_person": "人物偏左",
+    "right_person": "人物偏右",
+    "center_product": "产品居中",
+    "split_people_product": "人物与产品分区",
+    "device_center": "设备居中",
+    "full_scene": "完整场景",
+    "collage": "拼贴画面",
+}
+AREA_LABELS = {
+    "top": "顶部",
+    "bottom": "底部",
+    "left": "左侧",
+    "right": "右侧",
+    "upper_left": "左上",
+    "upper_center": "上方中部",
+    "upper_right": "右上",
+    "center_overlay": "中部叠字",
+    "around_subject": "主体周围",
+    "none": "无明显文字区",
+    "note_cards": "便签区域",
+}
 
 
 class LibraryError(RuntimeError):
     pass
+
+
+def validate_annotation(annotation: dict[str, Any]) -> None:
+    missing = [key for key in ANNOTATION_REQUIRED if key not in annotation]
+    if missing:
+        raise LibraryError(f"Annotation is missing required keys: {missing}")
+    if annotation["capacity"] not in CAPACITY_ORDER:
+        raise LibraryError(f"Invalid capacity: {annotation['capacity']}")
+    line_range = annotation["line_range"]
+    if (
+        not isinstance(line_range, list) or len(line_range) != 2
+        or not all(isinstance(value, int) and 0 <= value <= 6 for value in line_range)
+        or line_range[0] > line_range[1]
+    ):
+        raise LibraryError("line_range must be [min, max] with integers from 0 to 6")
+    for key in ("safe_areas", "hierarchy", "elements", "style", "hook", "content", "ocr"):
+        if not isinstance(annotation[key], list) or not all(isinstance(value, str) for value in annotation[key]):
+            raise LibraryError(f"{key} must be an array of strings")
+    for key in ("layout", "subject", "summary"):
+        if not isinstance(annotation[key], str) or not annotation[key].strip():
+            raise LibraryError(f"{key} must be a non-empty string")
+
+
+def parse_annotation(raw: Any, current_file_token: str) -> tuple[str, dict[str, Any] | None]:
+    if raw is None or raw == "":
+        return "missing", None
+    if not isinstance(raw, str) or not raw.strip():
+        return "invalid", None
+    machine_json = raw.split(MACHINE_INDEX_MARKER, 1)[1].strip() if MACHINE_INDEX_MARKER in raw else raw.strip()
+    try:
+        annotation = json.loads(machine_json)
+        if not isinstance(annotation, dict):
+            return "invalid", None
+        validate_annotation(annotation)
+    except (json.JSONDecodeError, LibraryError):
+        return "invalid", None
+    if annotation.get("v") != ANNOTATION_VERSION:
+        return "stale", annotation
+    if annotation.get("file_token") != current_file_token:
+        return "stale", annotation
+    return "valid", annotation
+
+
+def serialize_annotation(annotation: dict[str, Any]) -> str:
+    """Put a readable Chinese summary before the compact machine index."""
+    validate_annotation(annotation)
+    line_min, line_max = annotation["line_range"]
+    line_label = str(line_min) if line_min == line_max else f"{line_min}–{line_max}"
+    safe_areas = "、".join(AREA_LABELS.get(value, value) for value in annotation["safe_areas"]) or "未标明"
+    readable = [
+        f"【结构概览】{annotation['summary']}",
+        f"【文案承载】{CAPACITY_LABELS.get(annotation['capacity'], annotation['capacity'])}｜主标题 {line_label} 行",
+        (
+            f"【版式位置】{LAYOUT_LABELS.get(annotation['layout'], annotation['layout'])}"
+            f"｜主体：{SUBJECT_LABELS.get(annotation['subject'], annotation['subject'])}｜可放字：{safe_areas}"
+        ),
+    ]
+    machine_json = json.dumps(annotation, ensure_ascii=False, separators=(",", ":"))
+    return "\n".join([*readable, MACHINE_INDEX_MARKER, machine_json])
 
 
 def run_cli(args: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -70,15 +178,20 @@ def fetch_library(doc_url: str) -> dict[str, Any]:
         "--format", "json", "--as", "user",
     ])
     actual_fields = [field.get("name") for field in schema["data"].get("fields", [])]
-    missing = [name for name in EXPECTED_FIELDS if name not in actual_fields]
+    missing = [name for name in SOURCE_FIELDS if name not in actual_fields]
     if missing:
         raise LibraryError(f"Missing expected fields {missing}; actual fields: {actual_fields}")
+
+    structure_field_present = STRUCTURE_FIELD in actual_fields
+    query_fields = list(SOURCE_FIELDS)
+    if structure_field_present:
+        query_fields.append(STRUCTURE_FIELD)
 
     args = [
         "base", "+record-list", "--base-token", base_token, "--table-id", table_id,
         "--limit", "200", "--format", "json", "--as", "user",
     ]
-    for field in EXPECTED_FIELDS:
+    for field in query_fields:
         args.extend(["--field-id", field])
     payload = run_cli(args)
     data = payload["data"]
@@ -89,18 +202,177 @@ def fetch_library(doc_url: str) -> dict[str, Any]:
     rows = data.get("data", [])
     record_ids = data.get("record_id_list", [])
     for index, row in enumerate(rows):
-        values = dict(zip(EXPECTED_FIELDS, row))
+        values = dict(zip(query_fields, row))
         attachments = values.get("封面") or []
         attachment = attachments[0] if attachments else {}
+        file_token = attachment.get("file_token", "")
+        annotation_raw = values.get(STRUCTURE_FIELD) or ""
+        annotation_status, annotation = parse_annotation(annotation_raw, file_token)
         records.append({
             "cover_id": str(values.get("编号", "")),
             "record_id": record_ids[index] if index < len(record_ids) else "",
-            "file_token": attachment.get("file_token", ""),
+            "file_token": file_token,
             "filename": attachment.get("name", ""),
             "keywords": values.get("关键字") or "",
             "applicable_scene": values.get("适用场景") or "",
+            "annotation_status": annotation_status if structure_field_present else "field_missing",
+            "structure_annotation": annotation,
         })
-    return {"doc_url": doc_url, "base_token": base_token, "table_id": table_id, "records": records}
+    return {
+        "doc_url": doc_url,
+        "base_token": base_token,
+        "table_id": table_id,
+        "structure_field_present": structure_field_present,
+        "records": records,
+    }
+
+
+def audit_library(library: dict[str, Any]) -> dict[str, Any]:
+    groups: dict[str, list[str]] = {status: [] for status in ("valid", "missing", "stale", "invalid", "field_missing")}
+    for record in library["records"]:
+        groups.setdefault(record["annotation_status"], []).append(record["cover_id"])
+    return {
+        "structure_field": STRUCTURE_FIELD,
+        "field_present": library["structure_field_present"],
+        "total": len(library["records"]),
+        "counts": {status: len(ids) for status, ids in groups.items()},
+        "records": groups,
+        "ready": len(groups["valid"]) == len(library["records"]),
+    }
+
+
+def ensure_structure_field(doc_url: str) -> dict[str, Any]:
+    library = fetch_library(doc_url)
+    if library["structure_field_present"]:
+        return {"created": False, "field": STRUCTURE_FIELD, "message": "Field already exists"}
+    payload = run_cli([
+        "base", "+field-create",
+        "--base-token", library["base_token"],
+        "--table-id", library["table_id"],
+        "--json", json.dumps({
+            "name": STRUCTURE_FIELD,
+            "type": "text",
+            "description": "上方为中文结构概览，下方为 Codex 机器索引；按字段名读取。",
+        }, ensure_ascii=False),
+        "--format", "json", "--as", "user",
+    ])
+    return {"created": True, "field": STRUCTURE_FIELD, "result": payload.get("data", {})}
+
+
+def annotate_cover(
+    doc_url: str,
+    cover_id: str,
+    annotation_json: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    ensure_structure_field(doc_url)
+    library = fetch_library(doc_url)
+    by_id = {record["cover_id"]: record for record in library["records"]}
+    if cover_id not in by_id:
+        raise LibraryError(f"Unknown cover ID: {cover_id}")
+    return write_annotation(library, by_id[cover_id], annotation_json, force)
+
+
+def write_annotation(
+    library: dict[str, Any],
+    record: dict[str, Any],
+    annotation_json: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    cover_id = record["cover_id"]
+    if record["annotation_status"] == "valid" and not force:
+        return {"updated": False, "cover_id": cover_id, "message": "Valid annotation already exists"}
+    try:
+        annotation = json.loads(annotation_json)
+    except json.JSONDecodeError as exc:
+        raise LibraryError(f"Annotation is not valid JSON: {exc}") from exc
+    if not isinstance(annotation, dict):
+        raise LibraryError("Annotation must be a JSON object")
+    annotation.pop("v", None)
+    annotation.pop("file_token", None)
+    annotation.pop("annotated_at", None)
+    validate_annotation(annotation)
+    annotation = {
+        "v": ANNOTATION_VERSION,
+        "file_token": record["file_token"],
+        "annotated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **annotation,
+    }
+    payload = run_cli([
+        "base", "+record-upsert",
+        "--base-token", library["base_token"],
+        "--table-id", library["table_id"],
+        "--record-id", record["record_id"],
+        "--json", json.dumps({STRUCTURE_FIELD: serialize_annotation(annotation)}, ensure_ascii=False),
+        "--format", "json", "--as", "user",
+    ])
+    return {
+        "updated": True,
+        "cover_id": cover_id,
+        "record_id": record["record_id"],
+        "annotation": annotation,
+        "result": payload.get("data", {}),
+    }
+
+
+def format_index(doc_url: str) -> dict[str, Any]:
+    """Rewrite valid annotations into the readable display format without reanalysis."""
+    library = fetch_library(doc_url)
+    audit = audit_library(library)
+    if not audit["ready"]:
+        raise LibraryError(
+            "Cannot reformat an incomplete or stale index: "
+            + json.dumps(audit["records"], ensure_ascii=False)
+        )
+    results = []
+    for record in library["records"]:
+        annotation = record["structure_annotation"]
+        payload = run_cli([
+            "base", "+record-upsert",
+            "--base-token", library["base_token"],
+            "--table-id", library["table_id"],
+            "--record-id", record["record_id"],
+            "--json", json.dumps({STRUCTURE_FIELD: serialize_annotation(annotation)}, ensure_ascii=False),
+            "--format", "json", "--as", "user",
+        ])
+        results.append({
+            "cover_id": record["cover_id"],
+            "record_id": record["record_id"],
+            "updated": True,
+            "result": payload.get("data", {}),
+        })
+    return {"updated": len(results), "results": results}
+
+
+def annotate_batch(doc_url: str, annotations_json: str, force: bool = False) -> dict[str, Any]:
+    ensure_structure_field(doc_url)
+    library = fetch_library(doc_url)
+    try:
+        annotations = json.loads(annotations_json)
+    except json.JSONDecodeError as exc:
+        raise LibraryError(f"Batch annotations are not valid JSON: {exc}") from exc
+    if not isinstance(annotations, dict):
+        raise LibraryError("Batch annotations must be an object mapping cover IDs to annotation objects")
+    by_id = {record["cover_id"]: record for record in library["records"]}
+    results = []
+    for cover_id, annotation in annotations.items():
+        cover_id = str(cover_id)
+        if cover_id not in by_id:
+            raise LibraryError(f"Unknown cover ID in batch: {cover_id}")
+        if not isinstance(annotation, dict):
+            raise LibraryError(f"Annotation for cover {cover_id} must be an object")
+        results.append(write_annotation(
+            library,
+            by_id[cover_id],
+            json.dumps(annotation, ensure_ascii=False),
+            force,
+        ))
+    return {
+        "requested": len(annotations),
+        "updated": sum(1 for result in results if result.get("updated")),
+        "skipped": sum(1 for result in results if not result.get("updated")),
+        "results": results,
+    }
 
 
 def visible_length(text: str) -> int:
@@ -162,11 +434,35 @@ def analyze_copy(text: str) -> dict[str, Any]:
 
 
 def score_record(record: dict[str, Any], analysis: dict[str, Any]) -> tuple[float, list[str]]:
-    haystack = f"{record['keywords']} {record['applicable_scene']}".lower()
+    annotation = record.get("structure_annotation") or {}
+    annotation_text = json.dumps(annotation, ensure_ascii=False)
+    haystack = f"{annotation_text} {record['keywords']} {record['applicable_scene']}".lower()
     score = 0.0
     reasons: list[str] = []
     total = analysis["visible_characters"]
     lines = analysis["probable_lines"]
+
+    candidate_capacity = annotation.get("capacity")
+    if candidate_capacity in CAPACITY_ORDER:
+        distance = abs(CAPACITY_ORDER.index(analysis["length_class"]) - CAPACITY_ORDER.index(candidate_capacity))
+        if distance == 0:
+            score += 5.0
+            reasons.append("文案容量完全匹配")
+        elif distance == 1:
+            score += 2.0
+            reasons.append("文案容量相近")
+        else:
+            score -= min(4.0, float(distance))
+            reasons.append("文案容量存在差距")
+    line_range = annotation.get("line_range")
+    if isinstance(line_range, list) and len(line_range) == 2:
+        if line_range[0] <= lines <= line_range[1]:
+            score += 4.0
+            reasons.append("主文案行数匹配")
+        else:
+            line_distance = min(abs(lines - line_range[0]), abs(lines - line_range[1]))
+            score -= min(3.0, float(line_distance))
+            reasons.append("主文案行数需调整")
 
     if lines >= 3 and any(x in haystack for x in ("三行", "四行", "多行", "信息密度", "步骤", "流程")):
         score += 4.0
@@ -228,6 +524,20 @@ def score_record(record: dict[str, Any], analysis: dict[str, Any]) -> tuple[floa
             score += 2.0
             reasons.append(f"{intent} 主题")
 
+    hook_map: dict[str, tuple[str, ...]] = {
+        "tutorial": ("how_to", "tutorial"),
+        "problem-solution": ("problem_solution", "pain_relief", "choice_anxiety"),
+        "result-promise": ("result_promise", "time_promise", "benefit"),
+        "product-review": ("product_demo", "comparison", "novelty"),
+        "knowledge": ("authority", "knowledge", "method"),
+        "humor-surprise": ("humor", "surprise", "contrarian", "curiosity"),
+    }
+    annotation_hooks = set(annotation.get("hook") or [])
+    for intent in analysis["intents"]:
+        if annotation_hooks.intersection(hook_map.get(intent, ())):
+            score += 2.5
+            reasons.append(f"{intent} 钩子匹配")
+
     entities = set(re.findall(r"[a-z][a-z0-9.+-]{1,}", analysis["original_text"].lower()))
     generic = {"ai", "the", "how", "to"}
     exact = sorted(entity for entity in entities - generic if entity in haystack)
@@ -242,6 +552,12 @@ def score_record(record: dict[str, Any], analysis: dict[str, Any]) -> tuple[floa
 
 
 def ranked_library(library: dict[str, Any], text: str, top: int) -> dict[str, Any]:
+    audit = audit_library(library)
+    if not audit["ready"]:
+        raise LibraryError(
+            "Library annotations are incomplete or stale. Run `audit`, visually annotate affected covers, then retry: "
+            + json.dumps(audit["records"], ensure_ascii=False)
+        )
     analysis = analyze_copy(text)
     ranked = []
     for record in library["records"]:
@@ -253,7 +569,7 @@ def ranked_library(library: dict[str, Any], text: str, top: int) -> dict[str, An
         "analysis": analysis,
         "candidate_count": len(ranked),
         "shortlist": ranked[:top],
-        "note": "Preliminary scores optimize recall. Visually inspect and rerank before answering.",
+        "note": "Preliminary scores use the standardized visual index and optimize recall. Visually inspect and rerank before answering.",
     }
 
 
@@ -300,6 +616,26 @@ def parse_args() -> argparse.Namespace:
     list_parser = subparsers.add_parser("list", help="List all live cover records")
     list_parser.add_argument("--doc-url", dest="sub_doc_url")
 
+    audit_parser = subparsers.add_parser("audit", help="Audit visual annotation coverage and freshness")
+    audit_parser.add_argument("--doc-url", dest="sub_doc_url")
+
+    ensure_parser = subparsers.add_parser("ensure-field", help=f"Create the named {STRUCTURE_FIELD} field when absent")
+    ensure_parser.add_argument("--doc-url", dest="sub_doc_url")
+
+    format_parser = subparsers.add_parser("format-index", help="Put readable Chinese summaries above machine indexes")
+    format_parser.add_argument("--doc-url", dest="sub_doc_url")
+
+    annotate_parser = subparsers.add_parser("annotate", help="Write one visually verified structure annotation")
+    annotate_parser.add_argument("--doc-url", dest="sub_doc_url")
+    annotate_parser.add_argument("--cover-id", required=True)
+    annotate_parser.add_argument("--annotation", required=True, help="JSON object, or - to read stdin")
+    annotate_parser.add_argument("--force", action="store_true", help="Overwrite a currently valid annotation")
+
+    batch_parser = subparsers.add_parser("annotate-batch", help="Serially write a cover-ID to annotation JSON map")
+    batch_parser.add_argument("--doc-url", dest="sub_doc_url")
+    batch_parser.add_argument("--input", required=True, help="JSON file path, or - to read stdin")
+    batch_parser.add_argument("--force", action="store_true", help="Overwrite currently valid annotations")
+
     recommend_parser = subparsers.add_parser("recommend", help="Analyze copy and return a broad shortlist")
     recommend_parser.add_argument("--doc-url", dest="sub_doc_url")
     recommend_parser.add_argument("--text", required=True, help="Cover copy, or - to read stdin")
@@ -316,14 +652,27 @@ def main() -> int:
     args = parse_args()
     doc_url = args.sub_doc_url or args.doc_url
     try:
-        library = fetch_library(doc_url)
-        if args.command == "list":
-            result: dict[str, Any] = library
-        elif args.command == "recommend":
-            text = sys.stdin.read() if args.text == "-" else args.text
-            result = ranked_library(library, text, max(1, min(args.top, 20)))
+        if args.command == "ensure-field":
+            result = ensure_structure_field(doc_url)
+        elif args.command == "format-index":
+            result = format_index(doc_url)
+        elif args.command == "annotate":
+            annotation_json = sys.stdin.read() if args.annotation == "-" else args.annotation
+            result = annotate_cover(doc_url, args.cover_id, annotation_json, args.force)
+        elif args.command == "annotate-batch":
+            annotations_json = sys.stdin.read() if args.input == "-" else Path(args.input).expanduser().read_text()
+            result = annotate_batch(doc_url, annotations_json, args.force)
         else:
-            result = download_covers(library, args.cover_id, args.output_dir)
+            library = fetch_library(doc_url)
+            if args.command == "list":
+                result = library
+            elif args.command == "audit":
+                result = audit_library(library)
+            elif args.command == "recommend":
+                text = sys.stdin.read() if args.text == "-" else args.text
+                result = ranked_library(library, text, max(1, min(args.top, 20)))
+            else:
+                result = download_covers(library, args.cover_id, args.output_dir)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except LibraryError as exc:
