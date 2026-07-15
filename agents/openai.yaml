@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI 封面助手"
+  short_description: "根据封面文案从飞书案例库推荐合适的结构、排版与参考图"
+  default_prompt: "Use $recommend-cover-layout 根据我已确定的封面文案，从飞书封面库推荐并展示最合适的版式参考。"
