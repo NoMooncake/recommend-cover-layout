@@ -4,11 +4,11 @@ Use this rubric after the script returns a recall-oriented shortlist. The final 
 
 ## Priority order
 
-1. Copy shape (35%): total visible characters, intended line count, longest line, long-short contrast, and whether the example has enough text-safe area.
+1. Copy shape (35%): compare total visible characters, intended line count, longest line, and long-short contrast against annotation `capacity` and `line_range`.
 2. Information hierarchy (25%): one hook versus multiple points; headline/support/badge relationships; whether numbers, product names, or contrast words need separate emphasis.
 3. Topic and object needs (15%): tutorial, product, software, finance, knowledge, story, review, or problem-solving; required person, device, screenshot, product, or scene.
 4. Emotion and hook (15%): curiosity, surprise, urgency, authority, humor, pain relief, result promise, or calm explanation.
-5. Visual feasibility (10%): subject placement, contrast, background complexity, and whether the exact copy remains legible on a phone feed.
+5. Visual feasibility (10%): use annotation `subject`, `safe_areas`, `layout`, and `style` to judge whether the exact copy remains legible on a phone feed.
 
 Do not let topic overlap override a severe copy-shape mismatch.
 
@@ -29,6 +29,8 @@ For Chinese copy, count Chinese characters, Latin letters, and digits as visible
 - Exploratory: useful inspiration but requires meaningful structural adaptation.
 
 Never call a topical match Strong when the user's longest line cannot fit the example's main text area.
+
+Use `关键字` and `适用场景` only as supporting evidence. If they conflict with a valid visual annotation, inspect the image and prefer the verified visual structure.
 
 ## Output pattern
 
