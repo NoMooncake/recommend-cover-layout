@@ -252,7 +252,7 @@ def ensure_structure_field(doc_url: str) -> dict[str, Any]:
         "--json", json.dumps({
             "name": STRUCTURE_FIELD,
             "type": "text",
-            "description": "上方为中文结构概览，下方为 Codex 机器索引；按字段名读取。",
+            "description": "上方为中文结构概览，下方为 Agent 机器索引；按字段名读取。",
         }, ensure_ascii=False),
         "--format", "json", "--as", "user",
     ])
