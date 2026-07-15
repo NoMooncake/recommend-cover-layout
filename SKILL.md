@@ -5,7 +5,7 @@ description: Maintain an automatic visual-structure index for the user's Feishu 
 
 # AI Cover Layout Assistant
 
-Use the live Feishu library as the source of truth. Maintain the named `AI结构标注` field as a visual index; do not rely on its column position. Recommend structures from existing examples and do not invent a matching library item.
+Use the live Feishu library as the source of truth. Maintain the named `AI结构标注` field as a visual index; do not rely on its column position. Keep its human-readable Chinese overview at the top and its machine JSON index below the marker. Recommend structures from existing examples and do not invent a matching library item.
 
 ## Workflow
 
@@ -15,6 +15,8 @@ Use the live Feishu library as the source of truth. Maintain the named `AI结构
    ```bash
    python3 scripts/cover_library.py audit
    ```
+
+   The parser accepts both legacy pure JSON cells and the current Chinese-first display format.
 
 3. If `missing`, `stale`, or `invalid` annotations exist, complete them before recommending:
    - Run `python3 scripts/cover_library.py ensure-field` if the named field is absent.
@@ -64,6 +66,12 @@ Audit annotation coverage and image-token freshness:
 python3 scripts/cover_library.py audit
 ```
 
+Reformat valid legacy cells so Chinese explanations appear before machine fields, without reanalyzing images:
+
+```bash
+python3 scripts/cover_library.py format-index
+```
+
 Read cover copy from stdin:
 
 ```bash
@@ -85,6 +93,7 @@ python3 scripts/cover_library.py recommend --doc-url "<docx URL>" --text "<cover
 - Treat an annotation as stale when its stored image token differs from the current attachment token; reanalyze the image before matching.
 - Do not state that an example has a specific click-through rate unless the library contains that number. Call it a collected reference case instead.
 - Modify only the named `AI结构标注` field for annotation maintenance. Do not alter source images, keywords, applicable scenes, or other fields.
+- Keep the field readable for people: write `结构概览`, `文案承载`, and `版式位置` in Chinese first; keep compact JSON only below `--- 机器索引（请勿手动修改） ---`.
 - If no example fits well, say so, show at most two nearest references, and describe the missing structure that should be added to the library.
 
 ## Failure Handling

@@ -1,6 +1,18 @@
 # Visual annotation schema
 
-Store one compact JSON object in the named Feishu Base field `AI结构标注`. The script owns `v` and `file_token`; provide the remaining fields after visually inspecting the current image.
+Store one human-readable Chinese overview followed by one compact JSON object in the named Feishu Base field `AI结构标注`. The script creates the overview and owns `v` and `file_token`; provide the remaining fields after visually inspecting the current image.
+
+The stored cell must put the readable content first:
+
+```text
+【结构概览】顶部两行结果型大标题，人物居中展示设备，底部产品对照。
+【文案承载】中等文案｜主标题 2–3 行
+【版式位置】上下分区｜主体：人物居中｜可放字：顶部、底部
+--- 机器索引（请勿手动修改） ---
+{"v":1,"file_token":"...","capacity":"medium",...}
+```
+
+The parser remains compatible with legacy cells containing pure JSON. Do not ask users to edit the machine index manually.
 
 ## Required shape
 

@@ -20,11 +20,52 @@ DEFAULT_DOC_URL = "https://xinyouduzhong.feishu.cn/docx/E7pZdhudNo2glpxILQFcLxBg
 SOURCE_FIELDS = ("编号", "封面", "关键字", "适用场景")
 STRUCTURE_FIELD = "AI结构标注"
 ANNOTATION_VERSION = 1
+MACHINE_INDEX_MARKER = "--- 机器索引（请勿手动修改） ---"
 ANNOTATION_REQUIRED = (
     "capacity", "line_range", "layout", "subject", "safe_areas", "hierarchy",
     "elements", "style", "hook", "content", "ocr", "summary",
 )
 CAPACITY_ORDER = ("micro", "short", "medium", "long", "dense")
+CAPACITY_LABELS = {
+    "micro": "极少字",
+    "short": "少字",
+    "medium": "中等文案",
+    "long": "较长文案",
+    "dense": "多字密集",
+}
+LAYOUT_LABELS = {
+    "top_only": "文字集中在顶部",
+    "top_bottom": "上下分区",
+    "left_text_right_subject": "左文右人／物",
+    "right_text_left_subject": "右文左人／物",
+    "text_around_center_subject": "文字环绕中心主体",
+    "bottom_caption": "底部标题",
+    "full_scene_minimal_text": "完整场景配少量文字",
+    "collage_note_board": "拼贴／便签板",
+}
+SUBJECT_LABELS = {
+    "center_person": "人物居中",
+    "left_person": "人物偏左",
+    "right_person": "人物偏右",
+    "center_product": "产品居中",
+    "split_people_product": "人物与产品分区",
+    "device_center": "设备居中",
+    "full_scene": "完整场景",
+    "collage": "拼贴画面",
+}
+AREA_LABELS = {
+    "top": "顶部",
+    "bottom": "底部",
+    "left": "左侧",
+    "right": "右侧",
+    "upper_left": "左上",
+    "upper_center": "上方中部",
+    "upper_right": "右上",
+    "center_overlay": "中部叠字",
+    "around_subject": "主体周围",
+    "none": "无明显文字区",
+    "note_cards": "便签区域",
+}
 
 
 class LibraryError(RuntimeError):
@@ -57,8 +98,9 @@ def parse_annotation(raw: Any, current_file_token: str) -> tuple[str, dict[str, 
         return "missing", None
     if not isinstance(raw, str) or not raw.strip():
         return "invalid", None
+    machine_json = raw.split(MACHINE_INDEX_MARKER, 1)[1].strip() if MACHINE_INDEX_MARKER in raw else raw.strip()
     try:
-        annotation = json.loads(raw)
+        annotation = json.loads(machine_json)
         if not isinstance(annotation, dict):
             return "invalid", None
         validate_annotation(annotation)
@@ -69,6 +111,24 @@ def parse_annotation(raw: Any, current_file_token: str) -> tuple[str, dict[str, 
     if annotation.get("file_token") != current_file_token:
         return "stale", annotation
     return "valid", annotation
+
+
+def serialize_annotation(annotation: dict[str, Any]) -> str:
+    """Put a readable Chinese summary before the compact machine index."""
+    validate_annotation(annotation)
+    line_min, line_max = annotation["line_range"]
+    line_label = str(line_min) if line_min == line_max else f"{line_min}–{line_max}"
+    safe_areas = "、".join(AREA_LABELS.get(value, value) for value in annotation["safe_areas"]) or "未标明"
+    readable = [
+        f"【结构概览】{annotation['summary']}",
+        f"【文案承载】{CAPACITY_LABELS.get(annotation['capacity'], annotation['capacity'])}｜主标题 {line_label} 行",
+        (
+            f"【版式位置】{LAYOUT_LABELS.get(annotation['layout'], annotation['layout'])}"
+            f"｜主体：{SUBJECT_LABELS.get(annotation['subject'], annotation['subject'])}｜可放字：{safe_areas}"
+        ),
+    ]
+    machine_json = json.dumps(annotation, ensure_ascii=False, separators=(",", ":"))
+    return "\n".join([*readable, MACHINE_INDEX_MARKER, machine_json])
 
 
 def run_cli(args: list[str], cwd: Path | None = None) -> dict[str, Any]:
@@ -192,7 +252,7 @@ def ensure_structure_field(doc_url: str) -> dict[str, Any]:
         "--json", json.dumps({
             "name": STRUCTURE_FIELD,
             "type": "text",
-            "description": "Codex 视觉结构索引 JSON；按字段名读取，包含标注版本与图片 file_token。",
+            "description": "上方为中文结构概览，下方为 Codex 机器索引；按字段名读取。",
         }, ensure_ascii=False),
         "--format", "json", "--as", "user",
     ])
@@ -243,7 +303,7 @@ def write_annotation(
         "--base-token", library["base_token"],
         "--table-id", library["table_id"],
         "--record-id", record["record_id"],
-        "--json", json.dumps({STRUCTURE_FIELD: json.dumps(annotation, ensure_ascii=False, separators=(",", ":"))}, ensure_ascii=False),
+        "--json", json.dumps({STRUCTURE_FIELD: serialize_annotation(annotation)}, ensure_ascii=False),
         "--format", "json", "--as", "user",
     ])
     return {
@@ -253,6 +313,35 @@ def write_annotation(
         "annotation": annotation,
         "result": payload.get("data", {}),
     }
+
+
+def format_index(doc_url: str) -> dict[str, Any]:
+    """Rewrite valid annotations into the readable display format without reanalysis."""
+    library = fetch_library(doc_url)
+    audit = audit_library(library)
+    if not audit["ready"]:
+        raise LibraryError(
+            "Cannot reformat an incomplete or stale index: "
+            + json.dumps(audit["records"], ensure_ascii=False)
+        )
+    results = []
+    for record in library["records"]:
+        annotation = record["structure_annotation"]
+        payload = run_cli([
+            "base", "+record-upsert",
+            "--base-token", library["base_token"],
+            "--table-id", library["table_id"],
+            "--record-id", record["record_id"],
+            "--json", json.dumps({STRUCTURE_FIELD: serialize_annotation(annotation)}, ensure_ascii=False),
+            "--format", "json", "--as", "user",
+        ])
+        results.append({
+            "cover_id": record["cover_id"],
+            "record_id": record["record_id"],
+            "updated": True,
+            "result": payload.get("data", {}),
+        })
+    return {"updated": len(results), "results": results}
 
 
 def annotate_batch(doc_url: str, annotations_json: str, force: bool = False) -> dict[str, Any]:
@@ -533,6 +622,9 @@ def parse_args() -> argparse.Namespace:
     ensure_parser = subparsers.add_parser("ensure-field", help=f"Create the named {STRUCTURE_FIELD} field when absent")
     ensure_parser.add_argument("--doc-url", dest="sub_doc_url")
 
+    format_parser = subparsers.add_parser("format-index", help="Put readable Chinese summaries above machine indexes")
+    format_parser.add_argument("--doc-url", dest="sub_doc_url")
+
     annotate_parser = subparsers.add_parser("annotate", help="Write one visually verified structure annotation")
     annotate_parser.add_argument("--doc-url", dest="sub_doc_url")
     annotate_parser.add_argument("--cover-id", required=True)
@@ -562,6 +654,8 @@ def main() -> int:
     try:
         if args.command == "ensure-field":
             result = ensure_structure_field(doc_url)
+        elif args.command == "format-index":
+            result = format_index(doc_url)
         elif args.command == "annotate":
             annotation_json = sys.stdin.read() if args.annotation == "-" else args.annotation
             result = annotate_cover(doc_url, args.cover_id, annotation_json, args.force)
